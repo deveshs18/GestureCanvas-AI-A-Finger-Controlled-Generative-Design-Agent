@@ -2,29 +2,18 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import math # Keep math for potential distance calculations
-from deepface import DeepFace # For facial emotion detection
 import time # For timestamped filenames
+import os
+import base64
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
 
 # Global variables for drawing
 drawing_color = (255, 255, 255)  # Default: White (BGR)
 canvas = None
 prev_point = None # Previous point for drawing lines
 selected_color_index = 0 # To keep track of which color in the palette is active
-
-# --- Emotion Detection Globals ---
-emotion_analysis_interval = 90  # Analyze emotion every 90 frames (approx. 3 seconds at 30fps)
-frame_counter = 0
-detected_emotion = "neutral"
-emotion_color_suggestions = {
-    "happy": [4, 2],  # Suggest Yellow and Green
-    "sad": [3],       # Suggest Blue
-    "angry": [1],     # Suggest Red
-    "surprise": [4],  # Suggest Yellow
-    "neutral": [0],   # Suggest White
-    "fear": [3],      # Suggest Blue
-    "disgust": [2],   # Suggest Green
-}
-# --- End Emotion Detection Globals ---
 
 # Define the color palette (BGR format)
 # (More colors can be added)
@@ -39,10 +28,56 @@ palette_rects = [] # Will store (x, y, w, h) for each color rectangle
 palette_rect_size = 30 # Size of each color square in the palette
 palette_margin = 10 # Margin around palette and between squares
 
+# --- OpenAI Vision Integration ---
+llm = None
+
+def init_llm():
+    global llm
+    load_dotenv()
+    if not os.getenv("OPENAI_API_KEY"):
+        print("OPENAI_API_KEY not found. AI features will be disabled.")
+        return False
+    try:
+        # Use a vision-capable model
+        llm = ChatOpenAI(model="gpt-4o", max_tokens=100)
+        print("OpenAI Vision model (gpt-4o) initialized successfully.")
+        return True
+    except Exception as e:
+        print(f"Error initializing OpenAI Vision model: {e}")
+        llm = None
+        return False
+
+def get_openai_suggestion(image):
+    if not llm:
+        return "LLM not initialized."
+
+    # Encode the image to base64
+    _, buffer = cv2.imencode(".jpg", image)
+    image_base64 = base64.b64encode(buffer).decode("utf-8")
+
+    try:
+        msg = llm.invoke(
+            [
+                HumanMessage(
+                    content=[
+                        {"type": "text", "text": "Analyze the user's facial expression in this image. Based on their dominant emotion, suggest a palette of 3 colors. List the colors as BGR tuples, for example: (B,G,R), (B,G,R), (B,G,R)."},
+                        {
+                            "type": "image_url",
+                            "image_url": f"data:image/jpeg;base64,{image_base64}",
+                        },
+                    ]
+                )
+            ]
+        )
+        return msg.content
+    except Exception as e:
+        return f"Error getting suggestion from OpenAI: {e}"
+# --- End OpenAI Integration ---
+
 def main():
     global canvas, drawing_color, prev_point, palette_rects, selected_color_index
-    global frame_counter, detected_emotion
 
+    llm_initialized = init_llm()
     print("Gesture Drawing Canvas Starting...")
 
     # Initialize MediaPipe Hands
@@ -84,22 +119,6 @@ def main():
 
         # Flip the image horizontally for a later selfie-view display
         image = cv2.flip(image, 1)
-
-        # --- Emotion Detection Logic ---
-        frame_counter += 1
-        if frame_counter >= emotion_analysis_interval:
-            frame_counter = 0
-            try:
-                # DeepFace expects BGR, and 'image' is already in BGR format
-                analysis = DeepFace.analyze(image, actions=['emotion'], enforce_detection=False)
-                # DeepFace returns a list of dicts, one for each face. We'll use the first one.
-                if isinstance(analysis, list) and len(analysis) > 0:
-                    detected_emotion = analysis[0]['dominant_emotion']
-                    print(f"Detected Emotion: {detected_emotion}") # For debugging
-            except Exception as e:
-                # This can happen if a model file is missing or other issues arise
-                print(f"Error during emotion analysis: {e}")
-        # --- End Emotion Detection Logic ---
 
         # Convert the BGR image to RGB for MediaPipe
         rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -182,25 +201,13 @@ def main():
             display_image = image
 
         # --- Draw the Palette UI on top of everything ---
-        suggested_indices = emotion_color_suggestions.get(detected_emotion, [])
         for i, (x, y, w, h) in enumerate(palette_rects):
             cv2.rectangle(display_image, (x, y), (x + w, y + h), palette_colors[i], -1) # Filled rectangle
 
-            # Add highlight for recommended colors
-            if i in suggested_indices:
-                # Green border for suggestion
-                cv2.rectangle(display_image, (x - 4, y - 4), (x + w + 4, y + h + 4), (0, 255, 0), 2)
-
-            # Add highlight to the selected color (drawn on top of suggestion highlight if necessary)
+            # Add highlight to the selected color
             if i == selected_color_index:
                 # Cyan border for selection
                 cv2.rectangle(display_image, (x - 2, y - 2), (x + w + 2, y + h + 2), (255, 255, 0), 2)
-
-        # --- Display Detected Emotion ---
-        emotion_text = f"Emotion: {detected_emotion}"
-        text_pos = (palette_margin, display_image.shape[0] - palette_margin - 10) # Bottom-left
-        cv2.putText(display_image, emotion_text, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-
 
         cv2.imshow('Gesture Drawing Canvas', display_image)
 
