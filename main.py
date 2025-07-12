@@ -9,7 +9,8 @@ import collections # Added for deque
 import time # For generating unique filenames
 import os # For environment variables
 from dotenv import load_dotenv # For loading .env file
-from langchain_google_genai import ChatGoogleGenerativeAI # For Gemini
+# from langchain_google_genai import ChatGoogleGenerativeAI # For Gemini - Replaced
+from langchain_openai import ChatOpenAI # For OpenAI
 from langchain_core.messages import HumanMessage # For formatting LLM input
 
 # Helper function to calculate distance between two landmarks
@@ -22,17 +23,21 @@ llm = None
 def init_llm():
     global llm
     load_dotenv()
-    api_key = os.getenv("GOOGLE_API_KEY")
+    # OpenAI API key is typically loaded automatically by ChatOpenAI if OPENAI_API_KEY is in env
+    # but we can check for its existence for a clearer message.
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        print("GOOGLE_API_KEY not found in environment variables or .env file.")
+        print("OPENAI_API_KEY not found in environment variables or .env file.")
         print("LLM suggestions will be disabled.")
         return False
     try:
-        llm = ChatGoogleGenerativeAI(model="gemini-pro", google_api_key=api_key, convert_system_message_to_human=True)
-        print("LLM (Gemini Pro) initialized successfully.")
+        # You can specify a model like "gpt-3.5-turbo" or "gpt-4"
+        # If OPENAI_API_KEY is set in the environment, you don't strictly need to pass it here.
+        llm = ChatOpenAI(model_name="gpt-3.5-turbo")
+        print("LLM (OpenAI GPT-3.5 Turbo) initialized successfully.")
         return True
     except Exception as e:
-        print(f"Error initializing LLM: {e}")
+        print(f"Error initializing LLM with OpenAI: {e}")
         llm = None
         return False
 
