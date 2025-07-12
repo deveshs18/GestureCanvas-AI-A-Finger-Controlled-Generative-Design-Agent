@@ -1,94 +1,80 @@
-# GestureCanvas AI
-# main.py
-
 import cv2
 import mediapipe as mp
 import numpy as np
-import math
-import collections # Added for deque
-import time # For generating unique filenames
-import os # For environment variables
-from dotenv import load_dotenv # For loading .env file
-# from langchain_google_genai import ChatGoogleGenerativeAI # For Gemini - Replaced
-from langchain_openai import ChatOpenAI # For OpenAI
-from langchain_core.messages import HumanMessage # For formatting LLM input
+import math # Keep math for potential distance calculations
+from deepface import DeepFace # For facial emotion detection
+import time # For timestamped filenames
 
-# Helper function to calculate distance between two landmarks
-def calculate_distance(lm1, lm2):
-    return math.sqrt((lm1.x - lm2.x)**2 + (lm1.y - lm2.y)**2 + (lm1.z - lm2.z)**2)
+# Global variables for drawing
+drawing_color = (255, 255, 255)  # Default: White (BGR)
+canvas = None
+prev_point = None # Previous point for drawing lines
+selected_color_index = 0 # To keep track of which color in the palette is active
 
-# --- LLM Integration ---
-llm = None
+# --- Emotion Detection Globals ---
+emotion_analysis_interval = 90  # Analyze emotion every 90 frames (approx. 3 seconds at 30fps)
+frame_counter = 0
+detected_emotion = "neutral"
+emotion_color_suggestions = {
+    "happy": [4, 2],  # Suggest Yellow and Green
+    "sad": [3],       # Suggest Blue
+    "angry": [1],     # Suggest Red
+    "surprise": [4],  # Suggest Yellow
+    "neutral": [0],   # Suggest White
+    "fear": [3],      # Suggest Blue
+    "disgust": [2],   # Suggest Green
+}
+# --- End Emotion Detection Globals ---
 
-def init_llm():
-    global llm
-    load_dotenv()
-    # OpenAI API key is typically loaded automatically by ChatOpenAI if OPENAI_API_KEY is in env
-    # but we can check for its existence for a clearer message.
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print("OPENAI_API_KEY not found in environment variables or .env file.")
-        print("LLM suggestions will be disabled.")
-        return False
-    try:
-        # You can specify a model like "gpt-3.5-turbo" or "gpt-4"
-        # If OPENAI_API_KEY is set in the environment, you don't strictly need to pass it here.
-        llm = ChatOpenAI(model_name="gpt-3.5-turbo")
-        print("LLM (OpenAI GPT-3.5 Turbo) initialized successfully.")
-        return True
-    except Exception as e:
-        print(f"Error initializing LLM with OpenAI: {e}")
-        llm = None
-        return False
-
-def get_llm_suggestion(prompt_text):
-    if not llm:
-        return "LLM not initialized. Cannot get suggestions."
-    try:
-        message = HumanMessage(content=prompt_text)
-        response = llm.invoke([message])
-        return response.content
-    except Exception as e:
-        return f"Error getting suggestion from LLM: {e}"
-# --- End LLM Integration ---
+# Define the color palette (BGR format)
+# (More colors can be added)
+palette_colors = [
+    (255, 255, 255),  # White
+    (0, 0, 255),      # Red
+    (0, 255, 0),      # Green
+    (255, 0, 0),      # Blue
+    (0, 255, 255),    # Yellow
+]
+palette_rects = [] # Will store (x, y, w, h) for each color rectangle
+palette_rect_size = 30 # Size of each color square in the palette
+palette_margin = 10 # Margin around palette and between squares
 
 def main():
-    print("GestureCanvas AI starting...")
-    llm_initialized = init_llm()
+    global canvas, drawing_color, prev_point, palette_rects, selected_color_index
+    global frame_counter, detected_emotion
 
+    print("Gesture Drawing Canvas Starting...")
+
+    # Initialize MediaPipe Hands
     mp_hands = mp.solutions.hands
-    # Update max_num_hands to 2 for two-hand tracking
-    hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.7, min_tracking_confidence=0.5)
+    # Focusing on one hand for drawing simplicity for now
+    hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7, min_tracking_confidence=0.5)
     mp_drawing = mp.solutions.drawing_utils
 
     cap = cv2.VideoCapture(0)
 
-    # For swipe detection
-    # Store history of index finger tip positions for each hand
-    # hand_id -> deque of (x,y) tuples
-    index_finger_history = [collections.deque(maxlen=10) for _ in range(2)]
-    swipe_threshold_x = 0.07  # Min horizontal distance for swipe (normalized)
-    swipe_threshold_y = 0.07  # Min vertical distance for swipe (normalized)
-    swipe_debounce_frames = 5 # Number of frames to wait before detecting another swipe
-    swipe_cooldown = [0, 0] # Cooldown counter for each hand
-
-    # Pattern properties
-    pattern_pos = (320, 240) # Initial X, Y position (center of a 640x480 frame)
-    pattern_radius = 30
-    pattern_color = (0, 0, 255) # Red in BGR
-    available_colors = [
-        (0, 0, 255),  # Red
-        (0, 255, 0),  # Green
-        (255, 0, 0),  # Blue
-        (0, 255, 255), # Yellow
-        (255, 0, 255), # Magenta
-        (255, 255, 0)  # Cyan
-    ]
-    current_color_index = 0
-
     if not cap.isOpened():
         print("Error: Could not open webcam.")
         return
+
+    # Initialize canvas once we know frame dimensions
+    ret, frame = cap.read()
+    if not ret:
+        print("Error: Could not read frame from webcam.")
+        cap.release()
+        return
+
+    # Create a blank canvas for drawing (3 channels for BGR color)
+    # Initialize with black - user will draw with 'drawing_color' (e.g. white)
+    canvas = np.zeros((frame.shape[0], frame.shape[1], 3), dtype=np.uint8)
+
+    # --- Initialize Palette Rectangles ---
+    # Position the palette at the top of the screen
+    for i, color in enumerate(palette_colors):
+        x = palette_margin + i * (palette_rect_size + palette_margin)
+        y = palette_margin
+        palette_rects.append((x, y, palette_rect_size, palette_rect_size))
+    # --- End Palette Init ---
 
     while cap.isOpened():
         success, image = cap.read()
@@ -97,165 +83,137 @@ def main():
             continue
 
         # Flip the image horizontally for a later selfie-view display
-        # Convert the BGR image to RGB
-        image = cv2.cvtColor(cv2.flip(image, 1), cv2.COLOR_BGR2RGB)
+        image = cv2.flip(image, 1)
 
-        # To improve performance, optionally mark the image as not writeable to
-        # pass by reference.
-        image.flags.writeable = False
-        results = hands.process(image)
+        # --- Emotion Detection Logic ---
+        frame_counter += 1
+        if frame_counter >= emotion_analysis_interval:
+            frame_counter = 0
+            try:
+                # DeepFace expects BGR, and 'image' is already in BGR format
+                analysis = DeepFace.analyze(image, actions=['emotion'], enforce_detection=False)
+                # DeepFace returns a list of dicts, one for each face. We'll use the first one.
+                if isinstance(analysis, list) and len(analysis) > 0:
+                    detected_emotion = analysis[0]['dominant_emotion']
+                    print(f"Detected Emotion: {detected_emotion}") # For debugging
+            except Exception as e:
+                # This can happen if a model file is missing or other issues arise
+                print(f"Error during emotion analysis: {e}")
+        # --- End Emotion Detection Logic ---
 
-        # Draw the hand annotations on the image.
-        image.flags.writeable = True
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        # Convert the BGR image to RGB for MediaPipe
+        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        gesture = "None" # Variable to store detected gesture
+        # Process the image and find hands
+        results = hands.process(rgb_image)
+
+        # Convert the RGB image back to BGR for OpenCV display
+        # image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR) # This line is not needed if we use the original 'image'
+
+        # Hand landmark drawing and gesture logic will go here in future steps
 
         if results.multi_hand_landmarks:
-            for hand_idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
+            for hand_landmarks in results.multi_hand_landmarks:
+                # Draw landmarks on the original image (for user feedback)
                 mp_drawing.draw_landmarks(
                     image,
                     hand_landmarks,
                     mp_hands.HAND_CONNECTIONS,
-                    mp_drawing.DrawingSpec(color=(121, 22, 76), thickness=2, circle_radius=4),
-                    mp_drawing.DrawingSpec(color=(250, 44, 250), thickness=2, circle_radius=2),
+                    mp_drawing.DrawingSpec(color=(121, 22, 76), thickness=2, circle_radius=4), # Landmark color
+                    mp_drawing.DrawingSpec(color=(250, 44, 250), thickness=2, circle_radius=2) # Connection color
                 )
 
-                # Gesture detection logic
-                if len(hand_landmarks.landmark) > mp_hands.HandLandmark.INDEX_FINGER_TIP:
-                    thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
-                    index_finger_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+                # --- Drawing Logic ---
+                # Get coordinates of index finger tip and thumb tip
+                index_finger_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+                thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
 
-                    # Pinch detection
-                    pinch_distance = calculate_distance(thumb_tip, index_finger_tip)
-                    pinch_threshold = 0.06 # This threshold might need tuning
+                # Convert normalized coordinates to pixel coordinates
+                h, w, _ = image.shape
+                center_x, center_y = int(index_finger_tip.x * w), int(index_finger_tip.y * h)
 
-                    # Initialize current_gesture_for_hand for this hand
-                    current_gesture_for_hand = f"Hand {hand_idx}: Open"
+                # Calculate distance between thumb and index finger
+                pinch_distance = math.sqrt(
+                    (index_finger_tip.x - thumb_tip.x)**2 +
+                    (index_finger_tip.y - thumb_tip.y)**2
+                )
 
-                    if pinch_distance < pinch_threshold:
-                        current_gesture_for_hand = f"Hand {hand_idx}: Pinch"
-                        # Visual feedback for pinch
-                        cv2.circle(image, (int(thumb_tip.x * image.shape[1]), int(thumb_tip.y * image.shape[0])),
-                                   10, (0, 255, 0), -1)
-                        cv2.circle(image, (int(index_finger_tip.x * image.shape[1]), int(index_finger_tip.y * image.shape[0])),
-                                   10, (0, 255, 0), -1)
+                # Define drawing gesture: pinch gesture
+                pinch_threshold = 0.08 # Threshold to start drawing
 
-                        # Dynamic Size Control with Pinch:
-                        # Map pinch_distance to radius. Max distance for pinch is pinch_threshold.
-                        # Min distance is very small (e.g. 0.01).
-                        # Scale factor might need adjustment. Let radius range from 5 to 100.
-                        min_pinch_dist_for_radius = 0.01
-                        max_pinch_dist_for_radius = pinch_threshold
-                        # Ensure pinch_distance is within expected range for scaling
-                        clamped_dist = max(min_pinch_dist_for_radius, min(pinch_distance, max_pinch_dist_for_radius))
-                        # Scale normalized distance to pixel radius
-                        # When distance is small (clamped_dist ~ min_pinch_dist), radius is small.
-                        # When distance is large (clamped_dist ~ max_pinch_dist), radius is large.
-                        new_radius = 5 + (clamped_dist - min_pinch_dist_for_radius) / \
-                                     (max_pinch_dist_for_radius - min_pinch_dist_for_radius) * 95
-                        pattern_radius = int(new_radius)
+                # Check for color selection first
+                color_selected = False
+                if pinch_distance < pinch_threshold:
+                    for i, (x, y, w, h) in enumerate(palette_rects):
+                        if x < center_x < x + w and y < center_y < y + h:
+                            drawing_color = palette_colors[i]
+                            selected_color_index = i
+                            color_selected = True
+                            # When selecting a color, don't draw a point
+                            prev_point = None
+                            break # Exit after finding the selected color
 
+                if pinch_distance < pinch_threshold and not color_selected:
+                    # Drawing mode is active
+                    if prev_point is None:
+                        # Start of a new line
+                        prev_point = (center_x, center_y)
 
-                    # Tap detection (only if not pinching)
-                    elif len(hand_landmarks.landmark) > mp_hands.HandLandmark.MIDDLE_FINGER_TIP:
-                        middle_finger_tip = hand_landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
-                        tap_distance = calculate_distance(index_finger_tip, middle_finger_tip)
-                        tap_threshold = 0.05 # Threshold for tap, needs tuning
-
-                        if tap_distance < tap_threshold:
-                            current_gesture_for_hand = f"Hand {hand_idx}: Tap"
-                            cv2.circle(image, (int(index_finger_tip.x * image.shape[1]), int(index_finger_tip.y * image.shape[0])),
-                                       10, (255, 0, 0), -1)
-                            cv2.circle(image, (int(middle_finger_tip.x * image.shape[1]), int(middle_finger_tip.y * image.shape[0])),
-                                       10, (255, 0, 0), -1)
-                            # Tap to move pattern to index finger tip
-                            pattern_pos = (index_finger_tip.x * image.shape[1], index_finger_tip.y * image.shape[0])
-
-                    gesture = current_gesture_for_hand # Update main gesture string
-
-                    # Swipe Detection Logic (can override pinch/tap display for the frame it occurs)
-                    index_finger_history[hand_idx].append((index_finger_tip.x, index_finger_tip.y))
-
-                    if swipe_cooldown[hand_idx] > 0:
-                        swipe_cooldown[hand_idx] -= 1
-
-                    if len(index_finger_history[hand_idx]) == index_finger_history[hand_idx].maxlen and swipe_cooldown[hand_idx] == 0:
-                        start_pos = index_finger_history[hand_idx][0]
-                        end_pos = index_finger_history[hand_idx][-1]
-
-                        dx = end_pos[0] - start_pos[0]
-                        dy = end_pos[1] - start_pos[1]
-
-                        swipe_detected_this_frame = False
-                        if abs(dx) > swipe_threshold_x and abs(dx) > abs(dy) * 2: # Horizontal swipe
-                            if dx > 0:
-                                gesture = f"Hand {hand_idx}: Swipe Right"
-                                current_color_index = (current_color_index + 1) % len(available_colors)
-                            else:
-                                gesture = f"Hand {hand_idx}: Swipe Left"
-                                current_color_index = (current_color_index - 1 + len(available_colors)) % len(available_colors)
-                            pattern_color = available_colors[current_color_index]
-                            swipe_detected_this_frame = True
-                        elif abs(dy) > swipe_threshold_y and abs(dy) > abs(dx) * 2: # Vertical swipe
-                            # Vertical swipes currently don't change patterns, but gesture is detected
-                            if dy > 0:
-                                gesture = f"Hand {hand_idx}: Swipe Down"
-                            else:
-                                gesture = f"Hand {hand_idx}: Swipe Up"
-                            # Example: Could use vertical swipe to change pattern type or animation speed later
-                            swipe_detected_this_frame = True
-
-                        if swipe_detected_this_frame:
-                            swipe_cooldown[hand_idx] = swipe_debounce_frames
-                            index_finger_history[hand_idx].clear()
-
-                else: # if no landmarks for some reason for this hand_idx
-                    if hand_idx < len(index_finger_history):
-                        index_finger_history[hand_idx].clear()
-                    # Ensure gesture is reset if hand disappears or landmarks lost
-                    if gesture.startswith(f"Hand {hand_idx}"):
-                        gesture = "None"
+                    # Draw a line from the previous point to the current point
+                    cv2.line(canvas, prev_point, (center_x, center_y), drawing_color, thickness=5)
+                    prev_point = (center_x, center_y)
+                else:
+                    # Not in drawing mode, reset previous point
+                    prev_point = None
+        else:
+            # If no hands are detected, reset previous point
+            prev_point = None
 
 
-        # Display the detected gesture.
-        # This will overwrite if two hands show gestures simultaneously.
-        cv2.putText(image, f"Gesture: {gesture}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+        # --- Overlay drawing canvas on the main image ---
+        if canvas is not None:
+            img_gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+            _, drawn_mask = cv2.threshold(img_gray, 10, 255, cv2.THRESH_BINARY)
+            drawn_mask_inv = cv2.bitwise_not(drawn_mask)
+            img_bg = cv2.bitwise_and(image, image, mask=drawn_mask_inv)
+            img_fg = cv2.bitwise_and(canvas, canvas, mask=drawn_mask)
+            display_image = cv2.add(img_bg, img_fg)
+        else:
+            display_image = image
 
-        # Draw the pattern
-        # For now, pattern_pos is static. Later it can be dynamic.
-        # Ensure pattern_pos components are integers for cv2.circle
-        current_pattern_pos = (int(pattern_pos[0]), int(pattern_pos[1]))
-        cv2.circle(image, current_pattern_pos, pattern_radius, pattern_color, -1) # -1 for filled circle
+        # --- Draw the Palette UI on top of everything ---
+        suggested_indices = emotion_color_suggestions.get(detected_emotion, [])
+        for i, (x, y, w, h) in enumerate(palette_rects):
+            cv2.rectangle(display_image, (x, y), (x + w, y + h), palette_colors[i], -1) # Filled rectangle
 
-        # Decrement cooldowns even if no hands are detected this frame
-        for i in range(len(swipe_cooldown)):
-            if swipe_cooldown[i] > 0 and not results.multi_hand_landmarks:
-                 swipe_cooldown[i] -=1
+            # Add highlight for recommended colors
+            if i in suggested_indices:
+                # Green border for suggestion
+                cv2.rectangle(display_image, (x - 4, y - 4), (x + w + 4, y + h + 4), (0, 255, 0), 2)
+
+            # Add highlight to the selected color (drawn on top of suggestion highlight if necessary)
+            if i == selected_color_index:
+                # Cyan border for selection
+                cv2.rectangle(display_image, (x - 2, y - 2), (x + w + 2, y + h + 2), (255, 255, 0), 2)
+
+        # --- Display Detected Emotion ---
+        emotion_text = f"Emotion: {detected_emotion}"
+        text_pos = (palette_margin, display_image.shape[0] - palette_margin - 10) # Bottom-left
+        cv2.putText(display_image, emotion_text, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
 
 
-        cv2.imshow('GestureCanvas AI', image)
+        cv2.imshow('Gesture Drawing Canvas', display_image)
 
         key = cv2.waitKey(5) & 0xFF
         if key == 27:  # Press Esc to exit
             break
-        elif key == ord('s'): # Press 's' to save image
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            filename = f"gesture_canvas_{timestamp}.png"
-            # Save the image that is being displayed (includes webcam, landmarks, pattern)
-            cv2.imwrite(filename, image)
-            print(f"Image saved as {filename}")
-        elif key == ord('a') and llm_initialized: # Press 'a' to ask AI
-            print("Requesting suggestion from LLM...")
-            # Example prompt. This could be made more dynamic later.
-            prompt = "Suggest a calming color palette (3 colors in BGR format like (B,G,R), (B,G,R), (B,G,R)) and a simple geometric pattern type (like 'spiral', 'mandala', 'waves') for a desktop wallpaper."
-            suggestion = get_llm_suggestion(prompt)
-            print(f"\nLLM Suggestion:\n{suggestion}\n")
-            # Optional: Add code here to parse suggestion and apply it to the pattern
-            # For now, just printing. We could also display it on the OpenCV window.
-            # To display on screen, you might need to handle multi-line text.
-            # Example: cv2.putText(image, "AI: Check console", (10, image.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
-
+        elif key == ord('s'): # Press 's' to save the drawing
+            if canvas is not None:
+                timestamp = time.strftime("%Y%m%d-%H%M%S")
+                filename = f"drawing_{timestamp}.png"
+                # Save the drawing canvas only, not the webcam feed or UI
+                cv2.imwrite(filename, canvas)
+                print(f"Drawing saved as {filename}")
 
     hands.close()
     cap.release()
