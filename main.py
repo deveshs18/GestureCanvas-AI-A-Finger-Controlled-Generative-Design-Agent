@@ -97,13 +97,19 @@ def parse_ai_response(response):
         if speed_match:
             speed_map = {'slow': 20.0, 'medium': 50.0, 'fast': 80.0}
             theme['speed'] = speed_map.get(speed_match.group(1).lower(), DEFAULT_SPEED_FACTOR)
+
+        # Extract explanation
+        explanation_match = re.search(r"explanation:\s*(.*)", response, re.IGNORECASE)
+        if explanation_match:
+            theme['explanation'] = explanation_match.group(1).strip()
+
     except Exception as e:
         print(f"Error parsing AI response: {e}")
     return theme
 
 def apply_ai_theme():
     """Gets a theme from the LLM, parses it, and applies it to the scene."""
-    global current_shape, shape_index, base_color, shape_size, speed_factor
+    global current_shape, shape_index, base_color, shape_size, speed_factor, ai_explanation
     if not llm:
         print("AI not initialized. Cannot apply theme.")
         return
@@ -115,6 +121,7 @@ def apply_ai_theme():
     - color: [a single BGR tuple, e.g., (120, 50, 200)]
     - size: [one of small, medium, or large]
     - speed: [one of slow, medium, or fast]
+    - explanation: [a brief, creative explanation for the theme choice]
     """
     try:
         response = llm.invoke([HumanMessage(content=prompt)])
@@ -135,6 +142,8 @@ def apply_ai_theme():
             shape_size = theme['size']
         if 'speed' in theme:
             speed_factor = theme['speed']
+        if 'explanation' in theme:
+            ai_explanation = theme['explanation']
     except Exception as e:
         print(f"Error communicating with OpenAI: {e}")
 # --- End OpenAI Integration ---
@@ -233,117 +242,3 @@ def draw_tessellation(canvas, shape_type, size, color, offset_x, offset_y):
                 vertices_inv = cv2.transform(np.array([vertices_inv]), cv2.getRotationMatrix2D((x_center_offset, y_center_offset), 180, 1.0))[0]
                 cv2.fillPoly(canvas, [vertices_inv], color)
 # --- End Drawing Engine ---
-
-def main():
-    """Main function to run the application."""
-    global shape_index, current_shape, shape_size, base_color, grid_offset_x, grid_offset_y, right_hand_pinching, pinch_cooldown, speed_factor
-
-    # --- Setup ---
-    llm_initialized = init_llm()
-    print("Starting Gesture-Controlled Generative Art System...")
-    print("Controls: (A) AI Theme | (S) Save | (R) Reset | (ESC) Exit")
-    if not os.path.exists('screenshots'):
-        os.makedirs('screenshots')
-
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.7, min_tracking_confidence=0.5)
-    mp_drawing = mp.solutions.drawing_utils
-
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Error: Could not open webcam.")
-        return
-
-    while cap.isOpened():
-        success, image = cap.read()
-        if not success:
-            continue
-
-        image = cv2.flip(image, 1)
-        h, w, _ = image.shape
-        canvas = np.zeros((h, w, 3), dtype=np.uint8)
-
-        # --- Hand Tracking and Controls ---
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = hands.process(rgb_image)
-
-        if results.multi_hand_landmarks:
-            hand_data = {'left': None, 'right': None}
-            for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-                hand_type = handedness.classification[0].label.lower()
-                hand_data[hand_type] = hand_landmarks
-
-            # Right Hand Controls (Shape, Color, Size)
-            if hand_data['right']:
-                landmarks = hand_data['right'].landmark
-                # Position for Color (X->Hue, Y->Value)
-                h_val = int(landmarks[0].x * 179)
-                v_val = int(landmarks[0].y * 255)
-                base_color = tuple(map(int, cv2.cvtColor(np.uint8([[[h_val, 255, v_val]]]), cv2.COLOR_HSV2BGR)[0][0]))
-
-                # Pinch for Size and Shape
-                thumb_tip = landmarks[mp.solutions.hands.HandLandmark.THUMB_TIP]
-                index_tip = landmarks[mp.solutions.hands.HandLandmark.INDEX_FINGER_TIP]
-                pinch_dist = math.hypot(thumb_tip.x - index_tip.x, thumb_tip.y - index_tip.y)
-
-                # Pinch Distance for Size
-                min_pinch, max_pinch = 0.02, 0.2
-                shape_size = np.interp(pinch_dist, [min_pinch, max_pinch], [10.0, 100.0])
-
-                # Pinch Click for Shape Change
-                pinch_threshold = 0.05
-                if pinch_dist < pinch_threshold and not right_hand_pinching and pinch_cooldown == 0:
-                    right_hand_pinching = True
-                    shape_index = (shape_index + 1) % len(available_shapes)
-                    current_shape = available_shapes[shape_index]
-                    pinch_cooldown = 15
-                elif pinch_dist >= pinch_threshold:
-                    right_hand_pinching = False
-
-            if pinch_cooldown > 0:
-                pinch_cooldown -= 1
-
-            # Left Hand Controls (Movement)
-            if hand_data['left']:
-                wrist_pos = hand_data['left'].landmark[mp.solutions.hands.HandLandmark.WRIST]
-                control_x = wrist_pos.x - 0.5
-                control_y = wrist_pos.y - 0.5
-                grid_offset_x += control_x * speed_factor
-                grid_offset_y += control_y * speed_factor
-
-        # --- Drawing and Display ---
-        draw_tessellation(canvas, current_shape, shape_size, base_color, grid_offset_x, grid_offset_y)
-        display_image = cv2.addWeighted(canvas, 1, image, 0.3, 0) # Overlay webcam feed lightly
-
-        # UI Text
-        color_hex = bgr_to_hex(base_color)
-        info_text = f"Shape: {current_shape.capitalize()} | Color: {color_hex}"
-        cv2.putText(display_image, info_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-
-        # Draw landmarks on top of the combined image
-        if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
-                mp_drawing.draw_landmarks(display_image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-
-        cv2.imshow('Gesture-Controlled Generative Art', display_image)
-
-        # --- Keyboard Controls ---
-        key = cv2.waitKey(5) & 0xFF
-        if key == 27:
-            break
-        elif key == ord('a') and llm_initialized:
-            apply_ai_theme()
-        elif key == ord('s'):
-            filename = f"screenshots/tessellation_{time.strftime('%Y%m%d-%H%M%S')}.png"
-            cv2.imwrite(filename, canvas) # Save only the artwork
-            print(f"Artwork saved as {filename}")
-        elif key == ord('r'):
-            reset_scene()
-
-    # --- Cleanup ---
-    hands.close()
-    cap.release()
-    cv2.destroyAllWindows()
-
-if __name__ == "__main__":
-    main()

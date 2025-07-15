@@ -4,3 +4,4 @@ numpy
 langchain
 langchain-openai
 python-dotenv
+streamlit
